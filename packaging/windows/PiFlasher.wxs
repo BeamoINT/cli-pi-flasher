@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="PiFlasher" Manufacturer="PiFlasher" Version="0.1.0" UpgradeCode="2D44B7D6-CC0A-4F39-A07D-4A2051968E1A" Language="1033">
+    <MediaTemplate />
+
+    <Directory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PiFlasher" />
+    </Directory>
+
+    <Feature Id="MainFeature" Title="PiFlasher" Level="1">
+      <ComponentGroupRef Id="PiFlasherComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="CliBinary" Guid="*">
+        <File Id="piflasherCli" Source="dist\\piflasher.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="AgentBinary" Guid="*">
+        <File Id="piflasherAgent" Source="dist\\piflasher-agent.exe" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+    <ComponentGroup Id="PiFlasherComponents">
+      <ComponentRef Id="CliBinary" />
+      <ComponentRef Id="AgentBinary" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

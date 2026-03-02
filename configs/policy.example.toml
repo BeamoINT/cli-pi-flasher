@@ -1,0 +1,15 @@
+version = 1
+max_parallel = 10
+require_fingerprint_noninteractive = true
+
+[[allowed_readers]]
+label = "lab-bench-a"
+vid = "1234"
+pid = "5678"
+usb_serial_or_path_hash = "reader-serial"
+vendor = "ExampleVendor"
+product = "ExampleReader"
+capacity_min_bytes = 15000000000
+capacity_max_bytes = 128000000000
+
+quarantined_readers = []

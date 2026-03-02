@@ -1,0 +1,40 @@
+[workspace]
+members = [
+  "crates/piflasher-cli",
+  "crates/piflasher-agent",
+  "crates/piflasher-core",
+  "crates/piflasher-protocol",
+  "crates/piflasher-platform-macos",
+  "crates/piflasher-platform-windows",
+  "crates/piflasher-report",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["PiFlasher Team"]
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+fs2 = "0.4"
+hex = "0.4"
+rand = "0.9"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+xz2 = "0.1"
+libc = "0.2"

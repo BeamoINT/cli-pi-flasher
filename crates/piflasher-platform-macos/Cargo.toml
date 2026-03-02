@@ -1,0 +1,15 @@
+[package]
+name = "piflasher-platform-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+piflasher-core = { path = "../piflasher-core" }
+piflasher-protocol = { path = "../piflasher-protocol" }
+blake3.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+libc.workspace = true

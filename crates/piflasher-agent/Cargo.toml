@@ -1,0 +1,20 @@
+[package]
+name = "piflasher-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+piflasher-core = { path = "../piflasher-core" }
+piflasher-platform-macos = { path = "../piflasher-platform-macos" }
+piflasher-platform-windows = { path = "../piflasher-platform-windows" }
+piflasher-protocol = { path = "../piflasher-protocol" }
+piflasher-report = { path = "../piflasher-report" }
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
