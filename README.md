@@ -24,6 +24,22 @@ Useful commands:
 - `cargo run -p piflasher-cli -- verify --targets all`
 - `cargo run -p piflasher-cli -- reports show <job_id_prefix>`
 
+## Windows setup and launch
+
+For Windows, the repo includes scripts that make setup and launch simple:
+
+1. Run setup (installs required tools and builds the CLI):
+   - Double-click: `scripts\windows\setup-windows.cmd`
+   - Or in PowerShell: `.\scripts\windows\setup-windows.ps1`
+2. Start PiFlasher:
+   - Double-click: `scripts\windows\start-piflasher.cmd`
+
+Notes:
+
+- The start script auto-prompts for Administrator privileges when needed.
+- Keep `rpi.img.xz` in the repo root before launching.
+- Auto-eject is enabled by default after successful flash+verify.
+
 ## Workspace crates
 
 - `piflasher-cli`: user-facing CLI/TUI entrypoint.
