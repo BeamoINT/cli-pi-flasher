@@ -179,6 +179,7 @@ async fn run() -> anyhow::Result<i32> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn command_requires_raw_disk(command: &Command) -> bool {
     matches!(command, Command::Flash(_) | Command::Verify(_))
 }

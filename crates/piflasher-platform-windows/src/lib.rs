@@ -512,11 +512,14 @@ fn as_volume_handle_path(access_path: &str) -> Option<String> {
     if without_trailing.starts_with(r"\\.\") {
         return Some(without_trailing.to_string());
     }
-    if without_trailing.starts_with(r"\\?\Volume{") {
-        return Some(without_trailing.to_string());
-    }
 
-    if without_trailing.len() == 2 && without_trailing.as_bytes().get(1) == Some(&b':') {
+    if without_trailing.len() == 2
+        && without_trailing
+            .as_bytes()
+            .get(0)
+            .is_some_and(u8::is_ascii_alphabetic)
+        && without_trailing.as_bytes().get(1) == Some(&b':')
+    {
         return Some(format!(r"\\.\{without_trailing}"));
     }
 
@@ -645,11 +648,8 @@ mod tests {
     }
 
     #[test]
-    fn volume_guid_access_path_is_trimmed() {
-        assert_eq!(
-            as_volume_handle_path(r"\\?\Volume{abcd-ef}\"),
-            Some(r"\\?\Volume{abcd-ef}".to_string())
-        );
+    fn volume_guid_access_path_is_ignored_for_locking() {
+        assert_eq!(as_volume_handle_path(r"\\?\Volume{abcd-ef}\"), None);
     }
 
     #[test]
