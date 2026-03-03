@@ -316,6 +316,13 @@ fn discover_usb_disks() -> CoreResult<Vec<WindowsDiskSpec>> {
         }
 
         let size = row.get("Size").and_then(value_to_u64).unwrap_or(0);
+        if size == 0 {
+            // Windows can report placeholder USB disk entries (for example, empty multi-slot
+            // readers) with a size of 0 bytes. These are not writable targets and create a
+            // confusing extra drive option in the selector UI.
+            continue;
+        }
+
         let media_type = row
             .get("MediaType")
             .and_then(|v| v.as_str())
