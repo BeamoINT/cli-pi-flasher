@@ -360,7 +360,10 @@ impl BlockDevice for RawDiskBlockDevice {
             {
                 // Some raw disk nodes do not support fsync/fcntl sync ioctls.
                 // Fall back to a global sync barrier before readback verification.
-                unsafe { libc::sync() };
+                #[cfg(unix)]
+                unsafe {
+                    libc::sync()
+                };
                 Ok(())
             }
             Err(e) => Err(CoreError::WriteIo(format!(
