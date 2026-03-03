@@ -42,6 +42,7 @@ struct FlashVerifyResult {
 #[derive(Clone, Debug)]
 struct VerifyMismatchInfo {
     offset: u64,
+    chunk_start_offset: u64,
     chunk_len: usize,
     expected_chunk_blake3: String,
     actual_chunk_blake3: String,
@@ -824,6 +825,7 @@ fn run_verify_pass(
                 .unwrap_or(0);
             let mismatch = VerifyMismatchInfo {
                 offset: offset + relative as u64,
+                chunk_start_offset: offset,
                 chunk_len: n,
                 expected_chunk_blake3: blake3::hash(&src[..n]).to_hex().to_string(),
                 actual_chunk_blake3: blake3::hash(&dst[..n]).to_hex().to_string(),
@@ -896,7 +898,7 @@ fn confirm_mismatch_with_targeted_reread(
     let mut image_file = File::open(&prepared.cache_image_path)
         .map_err(|e| CoreError::ImagePreparation(format!("cache image open failed: {e}")))?;
     image_file
-        .seek(SeekFrom::Start(mismatch.offset))
+        .seek(SeekFrom::Start(mismatch.chunk_start_offset))
         .map_err(|e| CoreError::ImagePreparation(format!("cache image seek failed: {e}")))?;
 
     let mut expected = vec![0u8; mismatch.chunk_len];
@@ -907,7 +909,9 @@ fn confirm_mismatch_with_targeted_reread(
     for attempt in 1..=VERIFY_MISMATCH_REREAD_ATTEMPTS {
         let mut actual = vec![0u8; mismatch.chunk_len];
         let mut device = open_verify_device_with_retry(&manager, device_id)?;
-        if let Err(err) = read_exact_from_device(device.as_mut(), mismatch.offset, &mut actual) {
+        if let Err(err) =
+            read_exact_from_device(device.as_mut(), mismatch.chunk_start_offset, &mut actual)
+        {
             if is_verify_retryable_error(&err) && attempt < VERIFY_MISMATCH_REREAD_ATTEMPTS {
                 warn!(
                     device = %device_id,
@@ -1529,6 +1533,7 @@ mod tests {
         fail_eject: bool,
         fail_write_open: bool,
         fault_mode: ReadFaultMode,
+        require_aligned_reads: bool,
     }
 
     #[derive(Clone)]
@@ -1543,6 +1548,16 @@ mod tests {
             fault_mode: ReadFaultMode,
             fail_write_open: bool,
             fail_eject: bool,
+        ) -> Self {
+            Self::new_with_alignment(payload_len, fault_mode, fail_write_open, fail_eject, false)
+        }
+
+        fn new_with_alignment(
+            payload_len: usize,
+            fault_mode: ReadFaultMode,
+            fail_write_open: bool,
+            fail_eject: bool,
+            require_aligned_reads: bool,
         ) -> Self {
             let capacity = payload_len as u64 + 4096;
             let device = piflasher_protocol::DeviceInfo {
@@ -1576,6 +1591,7 @@ mod tests {
                     fail_eject,
                     fail_write_open,
                     fault_mode,
+                    require_aligned_reads,
                 })),
             }
         }
@@ -1703,6 +1719,11 @@ mod tests {
                 .state
                 .lock()
                 .expect("scripted state lock for read_at scripted read");
+            if state.require_aligned_reads && (offset % 512 != 0 || buf.len() % 512 != 0) {
+                return Err(CoreError::DeviceRemoved(format!(
+                    "failed to read raw device at offset {offset}: Invalid argument (os error 22)"
+                )));
+            }
             let start = offset as usize;
             if start >= state.storage.len() {
                 return Ok(0);
@@ -2015,6 +2036,34 @@ mod tests {
         assert!(matches!(result.status, TargetStatus::Success));
         assert!(result.hash_match);
         assert!(result.layout_check);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| { w.contains(super::WARN_VERIFY_TRANSIENT_MISMATCH_RESOLVED) }));
+    }
+
+    #[test]
+    fn verify_mismatch_transient_misaligned_offset_still_recovers_on_aligned_raw_reads() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(CHUNK_SIZE + 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+        let manager = Arc::new(ScriptedDeviceManager::new_with_alignment(
+            payload.len(),
+            ReadFaultMode::FirstSessionByteFlip {
+                offset: CHUNK_SIZE as u64 + 1000,
+            },
+            false,
+            false,
+            true,
+        ));
+
+        let manager_trait: Arc<dyn DeviceManager> = manager.clone();
+        let result =
+            process_flash_target(manager_trait, &manager.device_info(), &prepared, true, None)
+                .expect("flash target result");
+
+        assert!(matches!(result.status, TargetStatus::Success));
+        assert!(result.hash_match);
         assert!(result
             .warnings
             .iter()
