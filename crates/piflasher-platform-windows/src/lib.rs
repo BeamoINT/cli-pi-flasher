@@ -58,6 +58,14 @@ pub fn ensure_supported() -> CoreResult<()> {
 }
 
 impl WindowsDeviceManager {
+    fn disk_number_from_id(device_id: &str) -> CoreResult<u32> {
+        device_id
+            .strip_prefix("disk")
+            .ok_or_else(|| CoreError::InvalidRequest(format!("unexpected device id: {device_id}")))?
+            .parse::<u32>()
+            .map_err(|_| CoreError::InvalidRequest(format!("unexpected device id: {device_id}")))
+    }
+
     fn refresh_specs(&self) -> CoreResult<()> {
         let disks = discover_usb_disks()?;
         let mut specs = HashMap::new();
@@ -170,6 +178,9 @@ impl DeviceManager for WindowsDeviceManager {
                 "device already locked: {device_id}"
             )));
         }
+
+        let disk_number = Self::disk_number_from_id(device_id)?;
+        prepare_disk_for_raw_write(disk_number)?;
         locks.insert(device_id.to_string());
         Ok(())
     }
@@ -198,7 +209,6 @@ impl DeviceManager for WindowsDeviceManager {
 
         let spec = self.lookup(device_id)?;
         let file = OpenOptions::new()
-            .read(true)
             .write(true)
             .open(&spec.path)
             .map_err(|e| CoreError::WriteIo(format!("failed to open {}: {e}", spec.path)))?;
@@ -367,6 +377,34 @@ fn discover_usb_disks() -> CoreResult<Vec<WindowsDiskSpec>> {
     }
 
     Ok(specs)
+}
+
+fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<()> {
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         Set-Disk -Number {disk_number} -IsReadOnly $false -ErrorAction Stop; \
+         Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue | \
+         ForEach-Object {{ \
+             $_.AccessPaths | \
+             Where-Object {{ $_ -match '^[A-Za-z]:\\$' }} | \
+             ForEach-Object {{ mountvol $_ /p | Out-Null }} \
+         }}"
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| CoreError::DeviceBusy(format!("failed to prepare disk {disk_number}: {e}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(CoreError::DeviceBusy(format!(
+        "failed to dismount volumes on disk {disk_number}: {}",
+        stderr.trim()
+    )))
 }
 
 fn value_to_u64(value: &serde_json::Value) -> Option<u64> {
