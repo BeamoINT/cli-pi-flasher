@@ -42,22 +42,73 @@ function Install-WithWinget {
     param(
         [string]$Id,
         [string]$DisplayName,
-        [string]$OverrideArgs = ""
+        [string]$OverrideArgs = "",
+        [string]$Source = "winget"
     )
 
-    Write-Step "Installing $DisplayName (winget id: $Id)"
+    Write-Step "Installing $DisplayName (winget id: $Id, source: $Source)"
     $args = @(
         "install",
         "--id", $Id,
+        "--source", $Source,
         "--exact",
         "--accept-package-agreements",
         "--accept-source-agreements",
+        "--disable-interactivity",
         "--silent"
     )
     if ($OverrideArgs) {
         $args += @("--override", $OverrideArgs)
     }
+
     & winget.exe @args
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "winget failed to install $DisplayName (id: $Id) with exit code $exitCode"
+    }
+}
+
+function Ensure-RustToolchain {
+    Add-CargoToPath
+
+    if (Get-Command cargo.exe -ErrorAction SilentlyContinue) {
+        Write-Step "Rust toolchain already installed."
+        return
+    }
+
+    $wingetFailure = $null
+    try {
+        Install-WithWinget -Id "Rustlang.Rustup" -DisplayName "Rust toolchain (rustup)"
+    }
+    catch {
+        $wingetFailure = $_
+        Write-Step "winget rustup install failed. Falling back to rustup-init.exe direct installer."
+        Write-Warning $_
+    }
+
+    Add-CargoToPath
+    if (Get-Command cargo.exe -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    $rustupInit = Join-Path $env:TEMP "rustup-init.exe"
+    Write-Step "Downloading rustup-init.exe from static.rust-lang.org"
+    Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile $rustupInit
+
+    Write-Step "Running rustup-init.exe in non-interactive mode"
+    & $rustupInit -y --default-toolchain stable --profile default
+    $rustupExitCode = $LASTEXITCODE
+    if ($rustupExitCode -ne 0) {
+        if ($wingetFailure) {
+            throw "Rust installation failed via winget and rustup-init (exit code: $rustupExitCode). Last winget error: $($wingetFailure.Exception.Message)"
+        }
+        throw "rustup-init.exe failed with exit code $rustupExitCode"
+    }
+
+    Add-CargoToPath
+    if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
+        throw "cargo.exe was still not found after rustup-init install. Sign out/sign in and re-run setup."
+    }
 }
 
 function Add-CargoToPath {
@@ -100,14 +151,10 @@ if (-not $SkipToolInstall) {
         Write-Step "Git already installed."
     }
 
-    Add-CargoToPath
-    if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
-        Install-WithWinget -Id "Rustlang.Rustup" -DisplayName "Rust toolchain (rustup)"
-    } else {
-        Write-Step "Rust toolchain already installed."
-    }
+    Ensure-RustToolchain
 
     if (-not (Test-VsBuildToolsInstalled)) {
+        Write-Step "Visual Studio Build Tools can take several minutes to complete. Please wait..."
         Install-WithWinget `
             -Id "Microsoft.VisualStudio.2022.BuildTools" `
             -DisplayName "Visual Studio 2022 Build Tools (C++)" `
