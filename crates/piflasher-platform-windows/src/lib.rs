@@ -614,7 +614,7 @@ fn open_raw_disk(path: &str, write: bool) -> std::io::Result<File> {
             opts.custom_flags(FILE_FLAG_WRITE_THROUGH);
         }
         opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-        return opts.open(path);
+        opts.open(path)
     }
 
     #[cfg(not(target_os = "windows"))]
