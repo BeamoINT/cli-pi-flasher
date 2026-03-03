@@ -56,9 +56,33 @@ impl CoreError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            CoreError::DeviceBusy(_) | CoreError::WriteIo(_) | CoreError::DeviceRemoved(_)
-        )
+        match self {
+            CoreError::DeviceBusy(_) | CoreError::DeviceRemoved(_) => true,
+            CoreError::WriteIo(message) => {
+                let normalized = message.to_ascii_lowercase();
+                !(normalized.contains("access is denied")
+                    || normalized.contains("permission denied")
+                    || normalized.contains("os error 5")
+                    || normalized.contains("os error 13"))
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoreError;
+
+    #[test]
+    fn write_io_access_denied_is_not_retryable() {
+        let err = CoreError::WriteIo("Access is denied. (os error 5)".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn write_io_other_errors_remain_retryable() {
+        let err = CoreError::WriteIo("The semaphore timeout period has expired.".to_string());
+        assert!(err.is_retryable());
     }
 }
