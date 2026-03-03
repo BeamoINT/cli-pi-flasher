@@ -1,15 +1,27 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
+use std::time::Duration;
 
 use piflasher_core::device::{BlockDevice, DeviceManager, FileBackedDeviceManager};
 use piflasher_core::{CoreError, CoreResult};
 use piflasher_protocol::{DeviceFingerprint, DeviceInfo};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::IO::DeviceIoControl;
 
 #[derive(Clone, Debug)]
 struct WindowsDiskSpec {
@@ -26,7 +38,7 @@ struct WindowsDiskSpec {
 #[derive(Default)]
 struct WindowsDeviceManager {
     specs: Mutex<HashMap<String, WindowsDiskSpec>>,
-    locks: Mutex<HashSet<String>>,
+    locks: Mutex<HashMap<String, Vec<File>>>,
     sim: Option<FileBackedDeviceManager>,
 }
 
@@ -40,7 +52,7 @@ pub fn default_manager() -> CoreResult<Arc<dyn DeviceManager>> {
 
     Ok(Arc::new(WindowsDeviceManager {
         specs: Mutex::new(HashMap::new()),
-        locks: Mutex::new(HashSet::new()),
+        locks: Mutex::new(HashMap::new()),
         sim,
     }))
 }
@@ -175,15 +187,15 @@ impl DeviceManager for WindowsDeviceManager {
             .locks
             .lock()
             .map_err(|_| CoreError::Internal("windows lock set poisoned".to_string()))?;
-        if locks.contains(device_id) {
+        if locks.contains_key(device_id) {
             return Err(CoreError::DeviceBusy(format!(
                 "device already locked: {device_id}"
             )));
         }
 
         let disk_number = Self::disk_number_from_id(device_id)?;
-        prepare_disk_for_raw_write(disk_number)?;
-        locks.insert(device_id.to_string());
+        let lock_handles = prepare_disk_for_raw_write(disk_number)?;
+        locks.insert(device_id.to_string(), lock_handles);
         Ok(())
     }
 
@@ -198,7 +210,7 @@ impl DeviceManager for WindowsDeviceManager {
             .locks
             .lock()
             .map_err(|_| CoreError::Internal("windows lock set poisoned".to_string()))?;
-        locks.remove(device_id);
+        let _ = locks.remove(device_id);
         Ok(())
     }
 
@@ -381,7 +393,8 @@ fn discover_usb_disks() -> CoreResult<Vec<WindowsDiskSpec>> {
     Ok(specs)
 }
 
-fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<()> {
+#[cfg(target_os = "windows")]
+fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<Vec<File>> {
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
          Set-Disk -Number {disk_number} -IsReadOnly $false -ErrorAction Stop; \
@@ -390,13 +403,10 @@ fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<()> {
          foreach ($p in $parts) {{ \
              if ($p.DriveLetter) {{ \
                  $drive = [string]$p.DriveLetter; \
-                 try {{ Set-Volume -DriveLetter $drive -IsReadOnly $false -ErrorAction SilentlyContinue | Out-Null }} catch {{}}; \
-                 $accessPath = ($drive + ':\\'); \
-                 mountvol $accessPath /p | Out-Null; \
-                 if (Test-Path $accessPath) {{ throw ('failed to dismount volume ' + $accessPath) }} \
+                 try {{ Set-Volume -DriveLetter $drive -IsReadOnly $false -ErrorAction SilentlyContinue | Out-Null }} catch {{}} \
              }} \
          }}; \
-         Start-Sleep -Milliseconds 250"
+         Start-Sleep -Milliseconds 150"
     );
 
     let output = Command::new("powershell")
@@ -404,15 +414,187 @@ fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<()> {
         .output()
         .map_err(|e| CoreError::DeviceBusy(format!("failed to prepare disk {disk_number}: {e}")))?;
 
-    if output.status.success() {
-        return Ok(());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CoreError::DeviceBusy(format!(
+            "failed to prepare disk {disk_number}: {}",
+            stderr.trim()
+        )));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut locked_volumes = Vec::new();
+    for access_path in discover_partition_access_paths(disk_number)? {
+        let Some(volume_path) = as_volume_handle_path(&access_path) else {
+            continue;
+        };
+
+        let volume = lock_and_dismount_volume(&volume_path)?;
+        locked_volumes.push(volume);
+    }
+
+    Ok(locked_volumes)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn prepare_disk_for_raw_write(_disk_number: u32) -> CoreResult<Vec<File>> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "windows")]
+fn discover_partition_access_paths(disk_number: u32) -> CoreResult<Vec<String>> {
+    let script = format!(
+        "$parts = Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue; \
+         $paths = @(); \
+         foreach ($p in $parts) {{ \
+             foreach ($ap in $p.AccessPaths) {{ if ($ap) {{ $paths += [string]$ap }} }} \
+         }}; \
+         $paths | Select-Object -Unique | ConvertTo-Json -Compress"
+    );
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| {
+            CoreError::DeviceBusy(format!(
+                "failed to enumerate partition access paths for disk {disk_number}: {e}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CoreError::DeviceBusy(format!(
+            "failed to list partition access paths for disk {disk_number}: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() || stdout.eq_ignore_ascii_case("null") {
+        return Ok(Vec::new());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        CoreError::Internal(format!(
+            "failed to parse partition access path JSON for disk {disk_number}: {e}"
+        ))
+    })?;
+
+    let mut paths = Vec::new();
+    match value {
+        serde_json::Value::String(v) => {
+            if !v.trim().is_empty() {
+                paths.push(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(v) = item.as_str() {
+                    if !v.trim().is_empty() {
+                        paths.push(v.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(paths)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn as_volume_handle_path(access_path: &str) -> Option<String> {
+    let trimmed = access_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_trailing = trimmed.trim_end_matches('\\');
+    if without_trailing.starts_with(r"\\.\") {
+        return Some(without_trailing.to_string());
+    }
+    if without_trailing.starts_with(r"\\?\Volume{") {
+        return Some(without_trailing.to_string());
+    }
+
+    if without_trailing.len() == 2 && without_trailing.as_bytes().get(1) == Some(&b':') {
+        return Some(format!(r"\\.\{without_trailing}"));
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn lock_and_dismount_volume(volume_path: &str) -> CoreResult<File> {
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+
+    let mut opts = OpenOptions::new();
+    opts.read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    let file = opts.open(volume_path).map_err(|e| {
+        CoreError::DeviceBusy(format!("failed opening volume {volume_path} for lock: {e}"))
+    })?;
+
+    lock_volume_with_retry(&file, volume_path)?;
+    run_ioctl(&file, FSCTL_DISMOUNT_VOLUME).map_err(|e| {
+        CoreError::DeviceBusy(format!("failed to dismount volume {volume_path}: {e}"))
+    })?;
+
+    Ok(file)
+}
+
+#[cfg(target_os = "windows")]
+fn lock_volume_with_retry(file: &File, volume_path: &str) -> CoreResult<()> {
+    const MAX_ATTEMPTS: usize = 20;
+
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match run_ioctl(file, FSCTL_LOCK_VOLUME) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let code = err.raw_os_error().unwrap_or_default() as u32;
+                let retryable = matches!(
+                    code,
+                    ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION
+                );
+                last_err = Some(err);
+                if retryable && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    let err = last_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "unknown lock failure".to_string());
     Err(CoreError::DeviceBusy(format!(
-        "failed to dismount volumes on disk {disk_number}: {}",
-        stderr.trim()
+        "failed to lock volume {volume_path}; close Explorer/antivirus handles and retry: {err}"
     )))
+}
+
+#[cfg(target_os = "windows")]
+fn run_ioctl(file: &File, control_code: u32) -> std::io::Result<()> {
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as isize,
+            control_code,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn open_raw_disk(path: &str, write: bool) -> std::io::Result<File> {
@@ -451,4 +633,27 @@ fn value_to_u64(value: &serde_json::Value) -> Option<u64> {
         return s.parse::<u64>().ok();
     }
     value.as_f64().map(|v| v as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::as_volume_handle_path;
+
+    #[test]
+    fn drive_letter_access_path_converts_to_volume_handle() {
+        assert_eq!(as_volume_handle_path("E:\\"), Some(r"\\.\E:".to_string()));
+    }
+
+    #[test]
+    fn volume_guid_access_path_is_trimmed() {
+        assert_eq!(
+            as_volume_handle_path(r"\\?\Volume{abcd-ef}\"),
+            Some(r"\\?\Volume{abcd-ef}".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_access_path_is_ignored() {
+        assert_eq!(as_volume_handle_path(r"\Device\HarddiskVolume3"), None);
+    }
 }

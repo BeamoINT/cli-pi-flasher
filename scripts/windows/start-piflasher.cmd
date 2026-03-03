@@ -19,8 +19,9 @@ if not "%ERRORLEVEL%"=="0" (
 
 pushd "%REPO_ROOT%"
 
-if not exist "target\debug\piflasher.exe" (
-  echo PiFlasher binary not found. Running setup first...
+where cargo >nul 2>&1
+if errorlevel 1 (
+  echo cargo was not found on PATH. Running setup first...
   call "%SCRIPT_DIR%setup-windows.cmd"
   if errorlevel 1 (
     echo Setup failed.
@@ -41,7 +42,7 @@ if not exist "rpi.img.xz" (
 
 echo Starting PiFlasher...
 echo.
-"%REPO_ROOT%\target\debug\piflasher.exe" flash
+cargo run -p piflasher-cli -- flash
 set "EXIT_CODE=%ERRORLEVEL%"
 
 popd
