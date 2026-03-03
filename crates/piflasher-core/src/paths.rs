@@ -37,7 +37,7 @@ pub fn agent_socket_path(root: &Path) -> PathBuf {
     {
         // Use localhost TCP in initial cross-platform implementation.
         let _ = root;
-        return PathBuf::from("127.0.0.1:47550");
+        PathBuf::from("127.0.0.1:47550")
     }
 
     #[cfg(not(target_os = "windows"))]
