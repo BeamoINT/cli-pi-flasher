@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
 };
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Storage::FileSystem::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME};
+use windows_sys::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -581,7 +581,7 @@ fn run_ioctl(file: &File, control_code: u32) -> std::io::Result<()> {
     let mut returned = 0u32;
     let ok = unsafe {
         DeviceIoControl(
-            file.as_raw_handle() as isize,
+            file.as_raw_handle(),
             control_code,
             std::ptr::null_mut(),
             0,
