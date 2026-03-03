@@ -1719,7 +1719,9 @@ mod tests {
                 .state
                 .lock()
                 .expect("scripted state lock for read_at scripted read");
-            if state.require_aligned_reads && (offset % 512 != 0 || buf.len() % 512 != 0) {
+            if state.require_aligned_reads
+                && (!offset.is_multiple_of(512) || !buf.len().is_multiple_of(512))
+            {
                 return Err(CoreError::DeviceRemoved(format!(
                     "failed to read raw device at offset {offset}: Invalid argument (os error 22)"
                 )));
@@ -2008,9 +2010,7 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(crate::CoreError::PolicyDeny(_))));
-        let err = result
-            .err()
-            .expect("missing target should produce policy deny");
+        let err = result.expect_err("missing target should produce policy deny");
         assert!(err.to_string().contains("missing-device-id"));
     }
 

@@ -516,7 +516,7 @@ fn as_volume_handle_path(access_path: &str) -> Option<String> {
     if without_trailing.len() == 2
         && without_trailing
             .as_bytes()
-            .get(0)
+            .first()
             .is_some_and(u8::is_ascii_alphabetic)
         && without_trailing.as_bytes().get(1) == Some(&b':')
     {
