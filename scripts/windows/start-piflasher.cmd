@@ -3,6 +3,15 @@ setlocal
 
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%\..\..") do set "REPO_ROOT=%%~fI"
+set "PAUSE_AFTER_RUN=1"
+
+if /I "%~1"=="--no-pause" (
+  set "PAUSE_AFTER_RUN=0"
+)
+
+if /I "%PIFLASHER_NO_PAUSE%"=="1" (
+  set "PAUSE_AFTER_RUN=0"
+)
 
 if not exist "%REPO_ROOT%\Cargo.toml" (
   echo Could not locate repo root at "%REPO_ROOT%".
@@ -47,10 +56,17 @@ set "EXIT_CODE=%ERRORLEVEL%"
 
 popd
 
-if not "%EXIT_CODE%"=="0" (
-  echo.
+echo.
+if "%EXIT_CODE%"=="0" (
+  echo PiFlasher completed successfully.
+) else (
   echo PiFlasher exited with code %EXIT_CODE%.
-  pause
+)
+
+if "%PAUSE_AFTER_RUN%"=="1" (
+  echo.
+  echo Press any key to close this window.
+  pause >nul
 )
 
 exit /b %EXIT_CODE%
