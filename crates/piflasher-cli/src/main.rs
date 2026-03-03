@@ -117,7 +117,7 @@ struct FlashArgs {
     yes: bool,
     #[arg(
         long,
-        help = "Disable auto-eject after successful flash+verify (auto-eject is on by default)"
+        help = "Disable auto-eject after target processing (success or failure); auto-eject is enabled by default"
     )]
     no_eject: bool,
     #[arg(long)]

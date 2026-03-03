@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
@@ -25,7 +25,33 @@ use crate::{CoreError, CoreResult};
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const VERIFY_OPEN_MAX_ATTEMPTS: usize = 20;
 const VERIFY_OPEN_RETRY_DELAY_MS: u64 = 250;
+const VERIFY_MISMATCH_REREAD_ATTEMPTS: usize = 3;
+const VERIFY_MISMATCH_REREAD_DELAY_MS: u64 = 250;
+const WARN_VERIFY_TRANSIENT_MISMATCH_RESOLVED: &str = "W_VERIFY_TRANSIENT_MISMATCH_RESOLVED";
+const WARN_VERIFY_SOFT_PASS_BOOTABLE: &str = "W_VERIFY_SOFT_PASS_BOOTABLE";
+const WARN_EJECT_FAILED_AFTER_TARGET_COMPLETE: &str = "W_EJECT_FAILED_AFTER_TARGET_COMPLETE";
 pub const IMAGE_PREP_DEVICE_ID: &str = "__image_prepare__";
+
+#[derive(Clone, Debug)]
+struct FlashVerifyResult {
+    hash_match: bool,
+    layout_check: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct VerifyMismatchInfo {
+    offset: u64,
+    chunk_len: usize,
+    expected_chunk_blake3: String,
+    actual_chunk_blake3: String,
+}
+
+#[derive(Clone, Debug)]
+enum VerifyPassOutcome {
+    Matched,
+    Mismatch(VerifyMismatchInfo),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProgressPhase {
@@ -359,16 +385,14 @@ fn process_flash_target(
     progress: Option<ProgressCallback>,
 ) -> CoreResult<TargetResult> {
     let mut last_error = None;
+    let mut result: Option<TargetResult> = None;
 
     for attempt in 0..=1 {
-        match flash_once(
-            Arc::clone(&manager),
-            device,
-            prepared,
-            no_eject,
-            progress.clone(),
-        ) {
-            Ok(result) => return Ok(result),
+        match flash_once(Arc::clone(&manager), device, prepared, progress.clone()) {
+            Ok(target) => {
+                result = Some(target);
+                break;
+            }
             Err(e) => {
                 let retry = attempt == 0 && e.is_retryable();
                 if retry {
@@ -400,51 +424,69 @@ fn process_flash_target(
                         message: Some(e.to_string()),
                     },
                 );
-                return Ok(failure_target(device, Some(e.code()), e.to_string()));
+                result = Some(failure_target(device, Some(e.code()), e.to_string()));
+                break;
             }
         }
     }
 
-    if let Some(err) = last_error {
-        emit_progress(
-            &progress,
-            ProgressUpdate {
-                device_id: device.id.clone(),
-                phase: ProgressPhase::Failed,
-                write_done_bytes: 0,
-                write_total_bytes: prepared.bytes,
-                verify_done_bytes: 0,
-                verify_total_bytes: prepared.bytes,
-                message: Some(err.to_string()),
-            },
-        );
-        return Ok(failure_target(device, Some(err.code()), err.to_string()));
+    if result.is_none() {
+        if let Some(err) = last_error {
+            emit_progress(
+                &progress,
+                ProgressUpdate {
+                    device_id: device.id.clone(),
+                    phase: ProgressPhase::Failed,
+                    write_done_bytes: 0,
+                    write_total_bytes: prepared.bytes,
+                    verify_done_bytes: 0,
+                    verify_total_bytes: prepared.bytes,
+                    message: Some(err.to_string()),
+                },
+            );
+            result = Some(failure_target(device, Some(err.code()), err.to_string()));
+        } else {
+            emit_progress(
+                &progress,
+                ProgressUpdate {
+                    device_id: device.id.clone(),
+                    phase: ProgressPhase::Failed,
+                    write_done_bytes: 0,
+                    write_total_bytes: prepared.bytes,
+                    verify_done_bytes: 0,
+                    verify_total_bytes: prepared.bytes,
+                    message: Some("target failed for unknown reason".to_string()),
+                },
+            );
+            result = Some(failure_target(
+                device,
+                Some(ErrorCode::Internal),
+                "target failed for unknown reason".to_string(),
+            ));
+        }
     }
 
-    emit_progress(
-        &progress,
-        ProgressUpdate {
-            device_id: device.id.clone(),
-            phase: ProgressPhase::Failed,
-            write_done_bytes: 0,
-            write_total_bytes: prepared.bytes,
-            verify_done_bytes: 0,
-            verify_total_bytes: prepared.bytes,
-            message: Some("target failed for unknown reason".to_string()),
-        },
-    );
-    Ok(failure_target(
-        device,
-        Some(ErrorCode::Internal),
-        "target failed for unknown reason".to_string(),
-    ))
+    let mut result = result.expect("result set");
+    if !no_eject {
+        if let Err(err) = eject_with_retries(&manager, &device.id, 3) {
+            info!(
+                device = %device.id,
+                error = %err,
+                "auto-eject failed after target completion"
+            );
+            result.warnings.push(format!(
+                "{WARN_EJECT_FAILED_AFTER_TARGET_COMPLETE}: auto-eject failed: {err}"
+            ));
+        }
+    }
+
+    Ok(result)
 }
 
 fn flash_once(
     manager: Arc<dyn DeviceManager>,
     device: &DeviceInfo,
     prepared: &PreparedImage,
-    no_eject: bool,
     progress: Option<ProgressCallback>,
 ) -> CoreResult<TargetResult> {
     manager.lock(&device.id)?;
@@ -502,16 +544,13 @@ fn flash_once(
             message: None,
         },
     );
-    verify_device_against_image(Arc::clone(&manager), &device.id, prepared, &progress)?;
+    let verify_result = verify_device_against_image_for_flash(
+        Arc::clone(&manager),
+        &device.id,
+        prepared,
+        &progress,
+    )?;
     let verify_secs = verify_started.elapsed().as_secs_f64();
-
-    let mut warnings = Vec::new();
-    if !no_eject {
-        if let Err(err) = eject_with_retries(&manager, &device.id, 3) {
-            info!(device = %device.id, error = %err, "eject failed after successful verify");
-            warnings.push(format!("auto-eject failed: {err}"));
-        }
-    }
 
     emit_progress(
         &progress,
@@ -532,12 +571,12 @@ fn flash_once(
         bytes_written: prepared.bytes,
         write_secs,
         verify_secs,
-        hash_match: true,
-        layout_check: true,
+        hash_match: verify_result.hash_match,
+        layout_check: verify_result.layout_check,
         status: TargetStatus::Success,
         error_code: None,
         error_message: None,
-        warnings,
+        warnings: verify_result.warnings,
     })
 }
 
@@ -665,6 +704,83 @@ fn verify_device_against_image(
     prepared: &PreparedImage,
     progress: &Option<ProgressCallback>,
 ) -> CoreResult<()> {
+    match run_verify_pass(manager, device_id, prepared, progress)? {
+        VerifyPassOutcome::Matched => Ok(()),
+        VerifyPassOutcome::Mismatch(mismatch) => Err(CoreError::VerifyMismatch(
+            format_mismatch_message(&mismatch),
+        )),
+    }
+}
+
+fn verify_device_against_image_for_flash(
+    manager: Arc<dyn DeviceManager>,
+    device_id: &str,
+    prepared: &PreparedImage,
+    progress: &Option<ProgressCallback>,
+) -> CoreResult<FlashVerifyResult> {
+    let first_pass = run_verify_pass(Arc::clone(&manager), device_id, prepared, progress)?;
+    match first_pass {
+        VerifyPassOutcome::Matched => Ok(FlashVerifyResult {
+            hash_match: true,
+            layout_check: true,
+            warnings: Vec::new(),
+        }),
+        VerifyPassOutcome::Mismatch(first_mismatch) => {
+            warn!(
+                device = %device_id,
+                offset = first_mismatch.offset,
+                expected_chunk_blake3 = %first_mismatch.expected_chunk_blake3,
+                actual_chunk_blake3 = %first_mismatch.actual_chunk_blake3,
+                "primary verify pass mismatch detected"
+            );
+
+            if confirm_mismatch_with_targeted_reread(
+                Arc::clone(&manager),
+                device_id,
+                prepared,
+                &first_mismatch,
+            )? {
+                return Ok(FlashVerifyResult {
+                    hash_match: true,
+                    layout_check: true,
+                    warnings: vec![format!(
+                        "{WARN_VERIFY_TRANSIENT_MISMATCH_RESOLVED}: {}",
+                        format_mismatch_message(&first_mismatch)
+                    )],
+                });
+            }
+
+            match run_verify_pass(Arc::clone(&manager), device_id, prepared, progress)? {
+                VerifyPassOutcome::Matched => Ok(FlashVerifyResult {
+                    hash_match: true,
+                    layout_check: true,
+                    warnings: vec![format!(
+                        "{WARN_VERIFY_TRANSIENT_MISMATCH_RESOLVED}: {}",
+                        format_mismatch_message(&first_mismatch)
+                    )],
+                }),
+                VerifyPassOutcome::Mismatch(confirm_mismatch) => {
+                    verify_device_layout_only(Arc::clone(&manager), device_id)?;
+                    Ok(FlashVerifyResult {
+                        hash_match: false,
+                        layout_check: true,
+                        warnings: vec![format!(
+                            "{WARN_VERIFY_SOFT_PASS_BOOTABLE}: persistent mismatch accepted after layout check: {}",
+                            format_mismatch_message(&confirm_mismatch)
+                        )],
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn run_verify_pass(
+    manager: Arc<dyn DeviceManager>,
+    device_id: &str,
+    prepared: &PreparedImage,
+    progress: &Option<ProgressCallback>,
+) -> CoreResult<VerifyPassOutcome> {
     let mut image_file = File::open(&prepared.cache_image_path)
         .map_err(|e| CoreError::ImagePreparation(format!("cache image open failed: {e}")))?;
     let mut device = open_verify_device_with_retry(&manager, device_id)?;
@@ -701,10 +817,18 @@ fn verify_device_against_image(
         }
 
         if src[..n] != dst[..n] {
-            return Err(CoreError::VerifyMismatch(format!(
-                "byte mismatch detected at offset {}",
-                offset
-            )));
+            let relative = src[..n]
+                .iter()
+                .zip(&dst[..n])
+                .position(|(expected, actual)| expected != actual)
+                .unwrap_or(0);
+            let mismatch = VerifyMismatchInfo {
+                offset: offset + relative as u64,
+                chunk_len: n,
+                expected_chunk_blake3: blake3::hash(&src[..n]).to_hex().to_string(),
+                actual_chunk_blake3: blake3::hash(&dst[..n]).to_hex().to_string(),
+            };
+            return Ok(VerifyPassOutcome::Mismatch(mismatch));
         }
 
         if header_sample_filled < header_sample.len() {
@@ -760,7 +884,130 @@ fn verify_device_against_image(
         None
     };
     layout_check(&header_sample[..header_sample_filled], boot_sector)?;
+    Ok(VerifyPassOutcome::Matched)
+}
+
+fn confirm_mismatch_with_targeted_reread(
+    manager: Arc<dyn DeviceManager>,
+    device_id: &str,
+    prepared: &PreparedImage,
+    mismatch: &VerifyMismatchInfo,
+) -> CoreResult<bool> {
+    let mut image_file = File::open(&prepared.cache_image_path)
+        .map_err(|e| CoreError::ImagePreparation(format!("cache image open failed: {e}")))?;
+    image_file
+        .seek(SeekFrom::Start(mismatch.offset))
+        .map_err(|e| CoreError::ImagePreparation(format!("cache image seek failed: {e}")))?;
+
+    let mut expected = vec![0u8; mismatch.chunk_len];
+    image_file
+        .read_exact(&mut expected)
+        .map_err(|e| CoreError::ImagePreparation(format!("cache image read failed: {e}")))?;
+
+    for attempt in 1..=VERIFY_MISMATCH_REREAD_ATTEMPTS {
+        let mut actual = vec![0u8; mismatch.chunk_len];
+        let mut device = open_verify_device_with_retry(&manager, device_id)?;
+        if let Err(err) = read_exact_from_device(device.as_mut(), mismatch.offset, &mut actual) {
+            if is_verify_retryable_error(&err) && attempt < VERIFY_MISMATCH_REREAD_ATTEMPTS {
+                warn!(
+                    device = %device_id,
+                    attempt,
+                    max_attempts = VERIFY_MISMATCH_REREAD_ATTEMPTS,
+                    error = %err,
+                    "targeted mismatch re-read failed; retrying"
+                );
+                std::thread::sleep(StdDuration::from_millis(VERIFY_MISMATCH_REREAD_DELAY_MS));
+                continue;
+            }
+            return Err(err);
+        }
+
+        if actual == expected {
+            return Ok(true);
+        }
+
+        if attempt < VERIFY_MISMATCH_REREAD_ATTEMPTS {
+            std::thread::sleep(StdDuration::from_millis(VERIFY_MISMATCH_REREAD_DELAY_MS));
+        }
+    }
+
+    Ok(false)
+}
+
+fn read_exact_from_device(
+    device: &mut dyn BlockDevice,
+    mut offset: u64,
+    buf: &mut [u8],
+) -> CoreResult<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let read = device.read_at(offset, &mut buf[filled..])?;
+        if read == 0 {
+            return Err(CoreError::DeviceRemoved(format!(
+                "short read at offset {}",
+                offset
+            )));
+        }
+        filled += read;
+        offset += read as u64;
+    }
     Ok(())
+}
+
+fn verify_device_layout_only(manager: Arc<dyn DeviceManager>, device_id: &str) -> CoreResult<()> {
+    let mut device = open_verify_device_with_retry(&manager, device_id)?;
+    let mut header_sample = vec![0u8; 1024 * 1024];
+    let mut filled = 0usize;
+    while filled < header_sample.len() {
+        let read = device.read_at(filled as u64, &mut header_sample[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+
+    let mut boot_sector = [0u8; 512];
+    let mut boot_sector_filled = 0usize;
+    if let Some(sector_offset) = detect_boot_sector_offset(&header_sample[..filled]) {
+        if sector_offset + boot_sector.len() as u64 <= filled as u64 {
+            let start = sector_offset as usize;
+            let end = start + boot_sector.len();
+            boot_sector.copy_from_slice(&header_sample[start..end]);
+            boot_sector_filled = boot_sector.len();
+        } else {
+            while boot_sector_filled < boot_sector.len() {
+                let read = device.read_at(
+                    sector_offset + boot_sector_filled as u64,
+                    &mut boot_sector[boot_sector_filled..],
+                )?;
+                if read == 0 {
+                    return Err(CoreError::DeviceRemoved(format!(
+                        "short read while checking boot sector at offset {}",
+                        sector_offset + boot_sector_filled as u64
+                    )));
+                }
+                boot_sector_filled += read;
+            }
+        }
+    }
+
+    let boot_sector = if boot_sector_filled == boot_sector.len() {
+        Some(&boot_sector[..])
+    } else {
+        None
+    };
+    layout_check(&header_sample[..filled], boot_sector)
+}
+
+fn format_mismatch_message(mismatch: &VerifyMismatchInfo) -> String {
+    let expected_preview_len = mismatch.expected_chunk_blake3.len().min(12);
+    let actual_preview_len = mismatch.actual_chunk_blake3.len().min(12);
+    format!(
+        "byte mismatch detected at offset {} (expected_chunk_blake3={} actual_chunk_blake3={})",
+        mismatch.offset,
+        &mismatch.expected_chunk_blake3[..expected_preview_len],
+        &mismatch.actual_chunk_blake3[..actual_preview_len]
+    )
 }
 
 fn open_verify_device_with_retry(
@@ -773,7 +1020,7 @@ fn open_verify_device_with_retry(
         match manager.open_for_read(device_id) {
             Ok(device) => return Ok(device),
             Err(err) => {
-                let retryable = is_verify_open_retryable(&err);
+                let retryable = is_verify_retryable_error(&err);
                 if retryable && attempt < VERIFY_OPEN_MAX_ATTEMPTS {
                     warn!(
                         device = %device_id,
@@ -795,7 +1042,7 @@ fn open_verify_device_with_retry(
         .unwrap_or_else(|| CoreError::DeviceBusy("failed to open verify read handle".to_string())))
 }
 
-fn is_verify_open_retryable(err: &CoreError) -> bool {
+fn is_verify_retryable_error(err: &CoreError) -> bool {
     match err {
         CoreError::DeviceBusy(_) => true,
         CoreError::DeviceRemoved(message) | CoreError::WriteIo(message) => {
@@ -1243,17 +1490,20 @@ fn emit_progress(callback: &Option<ProgressCallback>, update: ProgressUpdate) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use piflasher_protocol::{FlashRequest, TargetSelector};
+    use chrono::Utc;
+    use piflasher_protocol::{ErrorCode, FlashRequest, TargetSelector, TargetStatus};
     use rand::{RngCore, SeedableRng};
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
-    use crate::device::{DeviceManager, FileBackedDeviceManager, FileDeviceSpec};
+    use crate::device::{BlockDevice, DeviceManager, FileBackedDeviceManager, FileDeviceSpec};
     use crate::paths::{ensure_layout, policy_path};
     use crate::policy::PolicyStore;
+    use crate::{CoreError, CoreResult};
 
-    use super::{execute_flash, FlashExecutionOptions};
+    use super::{execute_flash, process_flash_target, FlashExecutionOptions, CHUNK_SIZE};
 
     fn fake_image_xz(path: &std::path::Path, payload: &[u8]) {
         use std::io::Write;
@@ -1261,6 +1511,285 @@ mod tests {
         let mut encoder = xz2::write::XzEncoder::new(file, 6);
         encoder.write_all(payload).expect("write xz payload");
         encoder.finish().expect("finish xz payload");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadFaultMode {
+        None,
+        FirstSessionByteFlip { offset: u64 },
+        AlwaysByteFlip { offset: u64 },
+        AlwaysBootCorrupt,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedState {
+        storage: Vec<u8>,
+        read_open_count: usize,
+        eject_calls: usize,
+        fail_eject: bool,
+        fail_write_open: bool,
+        fault_mode: ReadFaultMode,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedDeviceManager {
+        device: piflasher_protocol::DeviceInfo,
+        state: Arc<Mutex<ScriptedState>>,
+    }
+
+    impl ScriptedDeviceManager {
+        fn new(
+            payload_len: usize,
+            fault_mode: ReadFaultMode,
+            fail_write_open: bool,
+            fail_eject: bool,
+        ) -> Self {
+            let capacity = payload_len as u64 + 4096;
+            let device = piflasher_protocol::DeviceInfo {
+                id: "disk-test".to_string(),
+                path: "/dev/mock".to_string(),
+                removable: true,
+                is_system_disk: false,
+                capacity_bytes: capacity,
+                bus: "usb".to_string(),
+                vendor: "Simulated".to_string(),
+                product: "Scripted".to_string(),
+                fingerprint: piflasher_protocol::DeviceFingerprint {
+                    vid: "SIM0".to_string(),
+                    pid: "SIM1".to_string(),
+                    usb_serial_or_path_hash: "abc123".to_string(),
+                    vendor: "Simulated".to_string(),
+                    product: "Scripted".to_string(),
+                    capacity_min_bytes: capacity.saturating_sub(1024),
+                    capacity_max_bytes: capacity.saturating_add(1024),
+                },
+                eligible: true,
+                ineligible_reasons: Vec::new(),
+            };
+
+            Self {
+                device,
+                state: Arc::new(Mutex::new(ScriptedState {
+                    storage: vec![0u8; capacity as usize],
+                    read_open_count: 0,
+                    eject_calls: 0,
+                    fail_eject,
+                    fail_write_open,
+                    fault_mode,
+                })),
+            }
+        }
+
+        fn device_info(&self) -> piflasher_protocol::DeviceInfo {
+            self.device.clone()
+        }
+
+        fn eject_calls(&self) -> usize {
+            self.state
+                .lock()
+                .expect("scripted state lock for eject_calls")
+                .eject_calls
+        }
+    }
+
+    impl DeviceManager for ScriptedDeviceManager {
+        fn list_devices(&self) -> CoreResult<Vec<piflasher_protocol::DeviceInfo>> {
+            Ok(vec![self.device.clone()])
+        }
+
+        fn lock(&self, _device_id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn unlock(&self, _device_id: &str) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn open_for_write(&self, _device_id: &str) -> CoreResult<Box<dyn BlockDevice>> {
+            let state = self
+                .state
+                .lock()
+                .expect("scripted state lock for open_for_write");
+            if state.fail_write_open {
+                return Err(CoreError::WriteIo(
+                    "Access is denied. (os error 5)".to_string(),
+                ));
+            }
+            drop(state);
+            Ok(Box::new(ScriptedWriteDevice {
+                state: Arc::clone(&self.state),
+            }))
+        }
+
+        fn open_for_read(&self, _device_id: &str) -> CoreResult<Box<dyn BlockDevice>> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("scripted state lock for open_for_read");
+            let session_index = state.read_open_count;
+            state.read_open_count += 1;
+            drop(state);
+            Ok(Box::new(ScriptedReadDevice {
+                state: Arc::clone(&self.state),
+                session_index,
+            }))
+        }
+
+        fn eject(&self, _device_id: &str) -> CoreResult<()> {
+            let mut state = self.state.lock().expect("scripted state lock for eject");
+            state.eject_calls += 1;
+            if state.fail_eject {
+                return Err(CoreError::DeviceBusy("simulated eject failure".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    struct ScriptedWriteDevice {
+        state: Arc<Mutex<ScriptedState>>,
+    }
+
+    impl BlockDevice for ScriptedWriteDevice {
+        fn write_at(&mut self, offset: u64, buf: &[u8]) -> CoreResult<usize> {
+            let mut state = self.state.lock().expect("scripted state lock for write_at");
+            let start = offset as usize;
+            let end = start.saturating_add(buf.len());
+            if end > state.storage.len() {
+                return Err(CoreError::WriteIo(format!(
+                    "out-of-range write start={start} len={}",
+                    buf.len()
+                )));
+            }
+            state.storage[start..end].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> CoreResult<usize> {
+            let state = self.state.lock().expect("scripted state lock for read_at");
+            let start = offset as usize;
+            if start >= state.storage.len() {
+                return Ok(0);
+            }
+            let len = buf.len().min(state.storage.len() - start);
+            buf[..len].copy_from_slice(&state.storage[start..start + len]);
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn capacity(&self) -> u64 {
+            self.state
+                .lock()
+                .expect("scripted state lock for capacity")
+                .storage
+                .len() as u64
+        }
+    }
+
+    struct ScriptedReadDevice {
+        state: Arc<Mutex<ScriptedState>>,
+        session_index: usize,
+    }
+
+    impl BlockDevice for ScriptedReadDevice {
+        fn write_at(&mut self, _offset: u64, _buf: &[u8]) -> CoreResult<usize> {
+            Err(CoreError::WriteIo("read-only scripted device".to_string()))
+        }
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> CoreResult<usize> {
+            let state = self
+                .state
+                .lock()
+                .expect("scripted state lock for read_at scripted read");
+            let start = offset as usize;
+            if start >= state.storage.len() {
+                return Ok(0);
+            }
+
+            let len = buf.len().min(state.storage.len() - start);
+            buf[..len].copy_from_slice(&state.storage[start..start + len]);
+
+            match state.fault_mode {
+                ReadFaultMode::None => {}
+                ReadFaultMode::FirstSessionByteFlip { offset } => {
+                    if self.session_index == 0 {
+                        maybe_flip_byte(&mut buf[..len], start as u64, offset);
+                    }
+                }
+                ReadFaultMode::AlwaysByteFlip { offset } => {
+                    maybe_flip_byte(&mut buf[..len], start as u64, offset);
+                }
+                ReadFaultMode::AlwaysBootCorrupt => {
+                    maybe_set_byte(&mut buf[..len], start as u64, 510, 0);
+                    maybe_set_byte(&mut buf[..len], start as u64, 511, 0);
+                }
+            }
+
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+
+        fn capacity(&self) -> u64 {
+            self.state
+                .lock()
+                .expect("scripted state lock for capacity")
+                .storage
+                .len() as u64
+        }
+    }
+
+    fn maybe_flip_byte(buf: &mut [u8], read_start: u64, target_offset: u64) {
+        if target_offset < read_start {
+            return;
+        }
+        let rel = (target_offset - read_start) as usize;
+        if rel < buf.len() {
+            buf[rel] ^= 0xFF;
+        }
+    }
+
+    fn maybe_set_byte(buf: &mut [u8], read_start: u64, target_offset: u64, value: u8) {
+        if target_offset < read_start {
+            return;
+        }
+        let rel = (target_offset - read_start) as usize;
+        if rel < buf.len() {
+            buf[rel] = value;
+        }
+    }
+
+    fn prepared_image_from_payload(
+        temp: &TempDir,
+        payload: &[u8],
+    ) -> piflasher_protocol::PreparedImage {
+        let cache_path = temp.path().join("prepared.img");
+        std::fs::write(&cache_path, payload).expect("write prepared image payload");
+        let blake3 = blake3::hash(payload).to_hex().to_string();
+        let mut sha = Sha256::new();
+        sha.update(payload);
+        let sha256 = hex::encode(sha.finalize());
+
+        piflasher_protocol::PreparedImage {
+            original_path: "./rpi.img.xz".to_string(),
+            cache_image_path: cache_path.to_string_lossy().to_string(),
+            cache_dir: temp.path().to_string_lossy().to_string(),
+            bytes: payload.len() as u64,
+            blake3,
+            sha256,
+            prepared_at: Utc::now(),
+        }
+    }
+
+    fn base_payload(size: usize) -> Vec<u8> {
+        let mut payload = vec![0u8; size];
+        payload[510] = 0x55;
+        payload[511] = 0xAA;
+        payload
     }
 
     #[tokio::test]
@@ -1465,17 +1994,194 @@ mod tests {
     }
 
     #[test]
+    fn verify_mismatch_transient_then_match_reports_success_warning() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(CHUNK_SIZE + 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+        let manager = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::FirstSessionByteFlip {
+                offset: CHUNK_SIZE as u64,
+            },
+            false,
+            false,
+        ));
+
+        let manager_trait: Arc<dyn DeviceManager> = manager.clone();
+        let result =
+            process_flash_target(manager_trait, &manager.device_info(), &prepared, true, None)
+                .expect("flash target result");
+
+        assert!(matches!(result.status, TargetStatus::Success));
+        assert!(result.hash_match);
+        assert!(result.layout_check);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| { w.contains(super::WARN_VERIFY_TRANSIENT_MISMATCH_RESOLVED) }));
+    }
+
+    #[test]
+    fn verify_mismatch_persistent_bootable_soft_pass() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(CHUNK_SIZE + 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+        let manager = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::AlwaysByteFlip {
+                offset: CHUNK_SIZE as u64,
+            },
+            false,
+            false,
+        ));
+
+        let manager_trait: Arc<dyn DeviceManager> = manager.clone();
+        let result =
+            process_flash_target(manager_trait, &manager.device_info(), &prepared, true, None)
+                .expect("flash target result");
+
+        assert!(matches!(result.status, TargetStatus::Success));
+        assert!(!result.hash_match);
+        assert!(result.layout_check);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| { w.contains(super::WARN_VERIFY_SOFT_PASS_BOOTABLE) }));
+    }
+
+    #[test]
+    fn verify_mismatch_persistent_nonbootable_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(CHUNK_SIZE + 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+        let manager = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::AlwaysBootCorrupt,
+            false,
+            false,
+        ));
+
+        let manager_trait: Arc<dyn DeviceManager> = manager.clone();
+        let result =
+            process_flash_target(manager_trait, &manager.device_info(), &prepared, true, None)
+                .expect("flash target result");
+
+        assert!(matches!(result.status, TargetStatus::Failed));
+        assert_eq!(result.error_code, Some(ErrorCode::LayoutCheck));
+    }
+
+    #[test]
+    fn failed_target_still_attempts_eject() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(2 * 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+        let manager = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::None,
+            true,
+            false,
+        ));
+
+        let manager_trait: Arc<dyn DeviceManager> = manager.clone();
+        let result = process_flash_target(
+            manager_trait,
+            &manager.device_info(),
+            &prepared,
+            false,
+            None,
+        )
+        .expect("flash target result");
+
+        assert!(matches!(result.status, TargetStatus::Failed));
+        assert_eq!(manager.eject_calls(), 1);
+    }
+
+    #[test]
+    fn no_eject_skips_eject_for_success_and_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(2 * 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+
+        let manager_success = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::None,
+            false,
+            false,
+        ));
+        let manager_success_trait: Arc<dyn DeviceManager> = manager_success.clone();
+        let success = process_flash_target(
+            manager_success_trait,
+            &manager_success.device_info(),
+            &prepared,
+            true,
+            None,
+        )
+        .expect("success target result");
+        assert!(matches!(success.status, TargetStatus::Success));
+        assert_eq!(manager_success.eject_calls(), 0);
+
+        let manager_failure = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::None,
+            true,
+            false,
+        ));
+        let manager_failure_trait: Arc<dyn DeviceManager> = manager_failure.clone();
+        let failed = process_flash_target(
+            manager_failure_trait,
+            &manager_failure.device_info(),
+            &prepared,
+            true,
+            None,
+        )
+        .expect("failed target result");
+        assert!(matches!(failed.status, TargetStatus::Failed));
+        assert_eq!(manager_failure.eject_calls(), 0);
+    }
+
+    #[test]
+    fn eject_failure_on_failed_target_becomes_warning() {
+        let temp = TempDir::new().expect("tempdir");
+        let payload = base_payload(2 * 1024 * 1024);
+        let prepared = prepared_image_from_payload(&temp, &payload);
+        let manager = Arc::new(ScriptedDeviceManager::new(
+            payload.len(),
+            ReadFaultMode::None,
+            true,
+            true,
+        ));
+
+        let manager_trait: Arc<dyn DeviceManager> = manager.clone();
+        let result = process_flash_target(
+            manager_trait,
+            &manager.device_info(),
+            &prepared,
+            false,
+            None,
+        )
+        .expect("flash target result");
+
+        assert!(matches!(result.status, TargetStatus::Failed));
+        assert_eq!(result.error_code, Some(ErrorCode::WriteIo));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains(super::WARN_EJECT_FAILED_AFTER_TARGET_COMPLETE)));
+        assert_eq!(manager.eject_calls(), 3);
+    }
+
+    #[test]
     fn verify_open_retryable_for_busy_errors() {
-        assert!(super::is_verify_open_retryable(
+        assert!(super::is_verify_retryable_error(
             &crate::CoreError::DeviceBusy("busy".to_string())
         ));
-        assert!(super::is_verify_open_retryable(
+        assert!(super::is_verify_retryable_error(
             &crate::CoreError::DeviceRemoved("Resource busy (os error 16)".to_string())
         ));
-        assert!(super::is_verify_open_retryable(&crate::CoreError::WriteIo(
-            "Access is denied. (os error 5)".to_string()
-        )));
-        assert!(!super::is_verify_open_retryable(
+        assert!(super::is_verify_retryable_error(
+            &crate::CoreError::WriteIo("Access is denied. (os error 5)".to_string())
+        ));
+        assert!(!super::is_verify_retryable_error(
             &crate::CoreError::VerifyMismatch("hash mismatch".to_string())
         ));
     }

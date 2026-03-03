@@ -38,7 +38,15 @@ Notes:
 
 - The start script auto-prompts for Administrator privileges when needed.
 - Keep `rpi.img.xz` in the repo root before launching.
-- Auto-eject is enabled by default after successful flash+verify.
+- Auto-eject is enabled by default after target processing (success or failure).
+
+## Verification warnings
+
+Flash reports may include warning tokens in `targets[].warnings`:
+
+- `W_VERIFY_TRANSIENT_MISMATCH_RESOLVED`: a mismatch was detected then resolved by confirm checks.
+- `W_VERIFY_SOFT_PASS_BOOTABLE`: persistent mismatch was accepted because boot/layout checks passed.
+- `W_EJECT_FAILED_AFTER_TARGET_COMPLETE`: auto-eject failed after processing a target.
 
 ## Workspace crates
 
