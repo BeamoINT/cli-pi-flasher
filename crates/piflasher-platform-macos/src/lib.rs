@@ -249,6 +249,12 @@ impl DeviceManager for MacDeviceManager {
 
         let spec = self.lookup(device_id)?;
         let file = open_raw_device_node(&spec.raw_node, false).map_err(|e| {
+            if matches!(e.raw_os_error(), Some(code) if code == libc::EBUSY) {
+                return CoreError::DeviceBusy(format!(
+                    "failed to open {} for read: {e}",
+                    spec.raw_node
+                ));
+            }
             CoreError::DeviceRemoved(format!("failed to open {} for read: {e}", spec.raw_node))
         })?;
         Ok(Box::new(RawDiskBlockDevice {
@@ -376,8 +382,6 @@ fn open_raw_device_node(path: &str, write: bool) -> std::io::Result<File> {
         if write {
             opts.write(true);
             opts.custom_flags(libc::O_EXLOCK | libc::O_SYNC);
-        } else {
-            opts.custom_flags(libc::O_EXLOCK);
         }
 
         match opts.open(path) {
@@ -386,10 +390,11 @@ fn open_raw_device_node(path: &str, write: bool) -> std::io::Result<File> {
                 return Ok(file);
             }
             Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP)
-                ) =>
+                if write
+                    && matches!(
+                        e.raw_os_error(),
+                        Some(libc::EINVAL) | Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP)
+                    ) =>
             {
                 // Fall through to a basic open on systems/drivers that reject lock/sync flags.
             }

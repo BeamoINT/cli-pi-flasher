@@ -23,6 +23,8 @@ use crate::policy::PolicyStore;
 use crate::{CoreError, CoreResult};
 
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const VERIFY_OPEN_MAX_ATTEMPTS: usize = 20;
+const VERIFY_OPEN_RETRY_DELAY_MS: u64 = 250;
 pub const IMAGE_PREP_DEVICE_ID: &str = "__image_prepare__";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,7 +667,7 @@ fn verify_device_against_image(
 ) -> CoreResult<()> {
     let mut image_file = File::open(&prepared.cache_image_path)
         .map_err(|e| CoreError::ImagePreparation(format!("cache image open failed: {e}")))?;
-    let mut device = manager.open_for_read(device_id)?;
+    let mut device = open_verify_device_with_retry(&manager, device_id)?;
 
     let mut src = vec![0u8; CHUNK_SIZE];
     let mut dst = vec![0u8; CHUNK_SIZE];
@@ -759,6 +761,55 @@ fn verify_device_against_image(
     };
     layout_check(&header_sample[..header_sample_filled], boot_sector)?;
     Ok(())
+}
+
+fn open_verify_device_with_retry(
+    manager: &Arc<dyn DeviceManager>,
+    device_id: &str,
+) -> CoreResult<Box<dyn BlockDevice>> {
+    let mut last_err: Option<CoreError> = None;
+
+    for attempt in 1..=VERIFY_OPEN_MAX_ATTEMPTS {
+        match manager.open_for_read(device_id) {
+            Ok(device) => return Ok(device),
+            Err(err) => {
+                let retryable = is_verify_open_retryable(&err);
+                if retryable && attempt < VERIFY_OPEN_MAX_ATTEMPTS {
+                    warn!(
+                        device = %device_id,
+                        attempt,
+                        max_attempts = VERIFY_OPEN_MAX_ATTEMPTS,
+                        error = %err,
+                        "verify read handle open failed; retrying"
+                    );
+                    last_err = Some(err);
+                    std::thread::sleep(StdDuration::from_millis(VERIFY_OPEN_RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| CoreError::DeviceBusy("failed to open verify read handle".to_string())))
+}
+
+fn is_verify_open_retryable(err: &CoreError) -> bool {
+    match err {
+        CoreError::DeviceBusy(_) => true,
+        CoreError::DeviceRemoved(message) | CoreError::WriteIo(message) => {
+            let normalized = message.to_ascii_lowercase();
+            normalized.contains("resource busy")
+                || normalized.contains("busy")
+                || normalized.contains("os error 16")
+                || normalized.contains("access is denied")
+                || normalized.contains("permission denied")
+                || normalized.contains("os error 5")
+                || normalized.contains("os error 13")
+        }
+        _ => false,
+    }
 }
 
 fn layout_check(header: &[u8], boot_sector: Option<&[u8]>) -> CoreResult<()> {
@@ -1411,5 +1462,21 @@ mod tests {
             .err()
             .expect("missing target should produce policy deny");
         assert!(err.to_string().contains("missing-device-id"));
+    }
+
+    #[test]
+    fn verify_open_retryable_for_busy_errors() {
+        assert!(super::is_verify_open_retryable(
+            &crate::CoreError::DeviceBusy("busy".to_string())
+        ));
+        assert!(super::is_verify_open_retryable(
+            &crate::CoreError::DeviceRemoved("Resource busy (os error 16)".to_string())
+        ));
+        assert!(super::is_verify_open_retryable(&crate::CoreError::WriteIo(
+            "Access is denied. (os error 5)".to_string()
+        )));
+        assert!(!super::is_verify_open_retryable(
+            &crate::CoreError::VerifyMismatch("hash mismatch".to_string())
+        ));
     }
 }
