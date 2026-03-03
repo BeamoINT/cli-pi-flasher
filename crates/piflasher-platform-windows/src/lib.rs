@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -208,10 +210,9 @@ impl DeviceManager for WindowsDeviceManager {
         }
 
         let spec = self.lookup(device_id)?;
-        let file = OpenOptions::new()
-            .write(true)
-            .open(&spec.path)
-            .map_err(|e| CoreError::WriteIo(format!("failed to open {}: {e}", spec.path)))?;
+        let file = open_raw_disk(&spec.path, true).map_err(|e| {
+            CoreError::WriteIo(format!("failed to open {} for write: {e}", spec.path))
+        })?;
 
         Ok(Box::new(RawDiskBlockDevice {
             file,
@@ -227,10 +228,9 @@ impl DeviceManager for WindowsDeviceManager {
         }
 
         let spec = self.lookup(device_id)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&spec.path)
-            .map_err(|e| CoreError::DeviceRemoved(format!("failed to open {}: {e}", spec.path)))?;
+        let file = open_raw_disk(&spec.path, false).map_err(|e| {
+            CoreError::DeviceRemoved(format!("failed to open {} for read: {e}", spec.path))
+        })?;
 
         Ok(Box::new(RawDiskBlockDevice {
             file,
@@ -256,10 +256,12 @@ struct RawDiskBlockDevice {
 impl BlockDevice for RawDiskBlockDevice {
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> CoreResult<usize> {
         self.file.seek(SeekFrom::Start(offset))?;
-        let written = self
-            .file
-            .write(buf)
-            .map_err(|e| CoreError::WriteIo(e.to_string()))?;
+        let written = self.file.write(buf).map_err(|e| {
+            CoreError::WriteIo(format!(
+                "raw write failed at offset {offset} ({} bytes): {e}",
+                buf.len()
+            ))
+        })?;
         Ok(written)
     }
 
@@ -383,12 +385,18 @@ fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<()> {
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
          Set-Disk -Number {disk_number} -IsReadOnly $false -ErrorAction Stop; \
-         Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue | \
-         ForEach-Object {{ \
-             $_.AccessPaths | \
-             Where-Object {{ $_ -match '^[A-Za-z]:\\$' }} | \
-             ForEach-Object {{ mountvol $_ /p | Out-Null }} \
-         }}"
+         Set-Disk -Number {disk_number} -IsOffline $false -ErrorAction Stop; \
+         $parts = Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue; \
+         foreach ($p in $parts) {{ \
+             if ($p.DriveLetter) {{ \
+                 $drive = [string]$p.DriveLetter; \
+                 try {{ Set-Volume -DriveLetter $drive -IsReadOnly $false -ErrorAction SilentlyContinue | Out-Null }} catch {{}}; \
+                 $accessPath = ($drive + ':\\'); \
+                 mountvol $accessPath /p | Out-Null; \
+                 if (Test-Path $accessPath) {{ throw ('failed to dismount volume ' + $accessPath) }} \
+             }} \
+         }}; \
+         Start-Sleep -Milliseconds 250"
     );
 
     let output = Command::new("powershell")
@@ -405,6 +413,34 @@ fn prepare_disk_for_raw_write(disk_number: u32) -> CoreResult<()> {
         "failed to dismount volumes on disk {disk_number}: {}",
         stderr.trim()
     )))
+}
+
+fn open_raw_disk(path: &str, write: bool) -> std::io::Result<File> {
+    #[cfg(target_os = "windows")]
+    {
+        const FILE_SHARE_READ: u32 = 0x00000001;
+        const FILE_SHARE_WRITE: u32 = 0x00000002;
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x80000000;
+
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        if write {
+            opts.write(true);
+            opts.custom_flags(FILE_FLAG_WRITE_THROUGH);
+        }
+        opts.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        return opts.open(path);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        if write {
+            opts.write(true);
+        }
+        opts.open(path)
+    }
 }
 
 fn value_to_u64(value: &serde_json::Value) -> Option<u64> {
