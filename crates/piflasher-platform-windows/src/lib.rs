@@ -272,7 +272,7 @@ impl BlockDevice for RawDiskBlockDevice {
 }
 
 fn discover_usb_disks() -> CoreResult<Vec<WindowsDiskSpec>> {
-    let script = "Get-CimInstance Win32_DiskDrive | Where-Object { $_.InterfaceType -eq 'USB' } | Select-Object Index,DeviceID,Model,Size,PNPDeviceID,MediaType,Manufacturer,InterfaceType | ConvertTo-Json -Compress";
+    let script = "Get-CimInstance Win32_DiskDrive | Where-Object { $_.InterfaceType -eq 'USB' } | Select-Object Index,DeviceID,Model,Size,PNPDeviceID,MediaType,Manufacturer,InterfaceType,MediaLoaded | ConvertTo-Json -Compress";
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
         .output()
@@ -316,7 +316,11 @@ fn discover_usb_disks() -> CoreResult<Vec<WindowsDiskSpec>> {
         }
 
         let size = row.get("Size").and_then(value_to_u64).unwrap_or(0);
-        if size == 0 {
+        let media_loaded = row
+            .get("MediaLoaded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !media_loaded || size < 1_048_576 {
             // Windows can report placeholder USB disk entries (for example, empty multi-slot
             // readers) with a size of 0 bytes. These are not writable targets and create a
             // confusing extra drive option in the selector UI.
